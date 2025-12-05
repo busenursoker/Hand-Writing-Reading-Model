@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Model artifacts (optional - uncomment if you don't want to commit trained models)
+# artifacts/
+# artifacts/*.keras
+# artifacts/*.json
+
+# Data files (EMNIST datasets are large, don't commit)
+data/*.csv
+data/emnist_source_files/
+
+# Test images (optional - uncomment if you don't want to commit test images)
+# test*.jpg
+# test*.png
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Debug outputs
+*.log
+
