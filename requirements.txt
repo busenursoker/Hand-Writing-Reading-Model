@@ -2,10 +2,12 @@ lmdb
 pillow
 nltk
 natsort
-torch==1.9.0
+torch
 torchvision
 six
 lmdb
 requests
 fire
 opencv-contrib-python
+fastapi
+uvicorn

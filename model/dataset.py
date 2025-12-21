@@ -12,7 +12,10 @@ from natsort import natsorted
 from PIL import Image
 import numpy as np
 from torch.utils.data import Dataset, ConcatDataset, Subset
-from torch._utils import _accumulate
+try:
+    from torch._utils import _accumulate
+except ImportError:
+    from itertools import accumulate as _accumulate
 import torchvision.transforms as transforms
 
 
