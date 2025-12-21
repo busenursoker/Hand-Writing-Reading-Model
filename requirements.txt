@@ -11,3 +11,4 @@ fire
 opencv-contrib-python
 fastapi
 uvicorn
+python-multipart
