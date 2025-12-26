@@ -1,15 +1,17 @@
-import os
-import uuid
-import tempfile
-import shutil
-import subprocess
-import hashlib
-from pathlib import Path
-
+import io
+import re
+import torch
+from PIL import Image
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
+from model.model import Model
+from model.utils import CTCLabelConverter
+
+
+# --------------------
+# FastAPI
+# --------------------
 app = FastAPI()
 
 app.add_middleware(
@@ -20,146 +22,116 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# AttentionHTR model/ klasörü
-ATTN_MODEL_DIR = Path("/home/beys/Text_Reco/HTR/model")
+# --------------------
+# MODEL CONFIG
+# --------------------
+class Opt:
+    Transformation = "TPS"
+    FeatureExtraction = "ResNet"
+    SequenceModeling = "BiLSTM"
+    Prediction = "CTC"
 
-# Model dosyası (absolute)
-SAVED_MODEL = ATTN_MODEL_DIR / "saved_model" / "AttentionHTR-General-sensitive.pth"
+    imgH = 32
+    imgW = 256
+    PAD = True
+    input_channel = 1
+    output_channel = 512
+    hidden_size = 256
+    num_fiducial = 20
+    batch_max_length = 120
+
+    # boşluk DAHİL – cümle için şart
+    character = "0123456789abcdefghijklmnopqrstuvwxyz .,!?'-\""
 
 
+opt = Opt()
+
+converter = CTCLabelConverter(opt.character)
+opt.num_class = len(converter.character)
+
+# --------------------
+# MODEL INIT
+# --------------------
+model = Model(opt)
+
+# Eğitilmiş model varsa açılır, yoksa kapalı kalır
+# model.load_state_dict(torch.load("path/to/your_model.pth", map_location=device))
+
+model = model.to(device)
+model.eval()
+
+# --------------------
+# CTC → CÜMLE POSTPROCESS
+# --------------------
+def ctc_sentence_postprocess(text: str) -> str:
+    """
+    Ham CTC çıktısını okunabilir cümleye çevirir
+    """
+    # çoklu boşluk → tek boşluk
+    text = re.sub(r"\s+", " ", text)
+
+    # noktalama öncesi boşlukları sil
+    text = re.sub(r"\s+([.,!?])", r"\1", text)
+
+    # baş/son boşluk temizle
+    text = text.strip()
+
+    # cümle başı büyük harf
+    if text:
+        text = text[0].upper() + text[1:]
+
+    return text
+
+
+# --------------------
+# IMAGE PREPROCESS
+# --------------------
+def preprocess_image(image: Image.Image) -> torch.Tensor:
+    image = image.convert("L")
+    image = image.resize((opt.imgW, opt.imgH))
+
+    img = torch.tensor(
+        torch.ByteTensor(torch.ByteStorage.from_buffer(image.tobytes()))
+        .float()
+        .view(opt.imgH, opt.imgW) / 255.0
+    )
+
+    img = img.unsqueeze(0).unsqueeze(0)
+    img = (img - 0.5) / 0.5
+
+    return img.to(device)
+
+
+# --------------------
+# ENDPOINTS
+# --------------------
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
-def _latest_new_log(before_set: set[str]) -> Path:
-    """
-    result/** altında log_predictions_*.txt dosyalarını arar.
-    before_set: test.py çalışmadan önce var olan log path listesi.
-    Yeni oluşan log varsa onu döndürür; yoksa en yeni log’u döndürür.
-    """
-    all_logs = sorted(
-        ATTN_MODEL_DIR.glob("result/**/log_predictions_*.txt"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    if not all_logs:
-        raise RuntimeError(f"No prediction log file found under {ATTN_MODEL_DIR / 'result'}")
-
-    new_logs = [p for p in all_logs if p.as_posix() not in before_set]
-    return new_logs[0] if new_logs else all_logs[0]
-
-
-def attentionhtr_predict_single(image_path: str) -> str:
-    if not SAVED_MODEL.exists():
-        raise FileNotFoundError(f"Saved model not found: {SAVED_MODEL}")
-    if not (ATTN_MODEL_DIR / "test.py").exists():
-        raise FileNotFoundError(f"test.py not found under: {ATTN_MODEL_DIR}")
-
-    # test.py çalışmadan önce mevcut log’ların listesini al (recursive)
-    before = {p.as_posix() for p in ATTN_MODEL_DIR.glob("result/**/log_predictions_*.txt")}
-
-    req_id = uuid.uuid4().hex[:10]
-    dataset_name = f"api_{req_id}"
-
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-
-        input_dir = tmp / "input"
-        input_dir.mkdir(parents=True, exist_ok=True)
-
-        src = Path(image_path)
-        dst = input_dir / src.name
-        shutil.copyfile(src, dst)
-
-        # (debug) modelin gerçekten gördüğü dosya aynı mı?
-        dst_bytes = dst.read_bytes()
-        print(f"[TMP_INPUT] name={dst.name} bytes={len(dst_bytes)} md5={hashlib.md5(dst_bytes).hexdigest()}")
-
-        gt_path = tmp / "gt.txt"
-        gt_path.write_text(f"{dst.name}\t-\n", encoding="utf-8")
-
-        out_lmdb = tmp / dataset_name
-
-        # 1) LMDB üret
-        subprocess.check_call(
-            [
-                "python3",
-                str(ATTN_MODEL_DIR / "create_lmdb_dataset.py"),
-                "--inputPath",
-                str(input_dir),
-                "--gtFile",
-                str(gt_path),
-                "--outputPath",
-                str(out_lmdb),
-            ],
-            cwd=str(ATTN_MODEL_DIR),
-        )
-
-        # 2) test.py çalıştır
-        # Not: absolute saved_model veriyoruz; log klasörü sanitize edilip result/ altında oluşuyor (sende gördüğümüz gibi)
-        subprocess.check_call(
-            [
-                "python3",
-                str(ATTN_MODEL_DIR / "test.py"),
-                "--eval_data",
-                str(out_lmdb),
-                "--Transformation",
-                "TPS",
-                "--FeatureExtraction",
-                "ResNet",
-                "--SequenceModeling",
-                "BiLSTM",
-                "--Prediction",
-                "Attn",
-                "--saved_model",
-                str(SAVED_MODEL),
-                "--sensitive",
-            ],
-            cwd=str(ATTN_MODEL_DIR),
-        )
-
-    # 3) Bu request’in oluşturduğu log’u bul (result/** altında)
-    log_file = _latest_new_log(before)
-    print(f"[LOG] using: {log_file}")
-
-    # 4) prediction çek (son data satırı)
-    lines = log_file.read_text(encoding="utf-8", errors="ignore").strip().splitlines()
-    pred = ""
-    for line in reversed(lines):
-        if line.startswith("batch,") or not line.strip():
-            continue
-        parts = line.split(",")
-        if len(parts) >= 3:
-            pred = parts[2].strip()
-            break
-
-    return pred
-
-
-@app.post("/predict-word")
-async def predict_word_api(
-    image: UploadFile = File(...),
-    infer_orientation: str = "auto",  # frontend bozmasın diye duruyor; şimdilik kullanılmıyor
-):
-    ext = os.path.splitext(image.filename)[1].lower() or ".jpg"
-    filename = f"{uuid.uuid4().hex}{ext}"
-    path = os.path.join(UPLOAD_DIR, filename)
-
+@app.post("/predict")
+async def predict_sentence(image: UploadFile = File(...)):
     data = await image.read()
-    sha = hashlib.md5(data).hexdigest()
-    print(f"[UPLOAD] filename={image.filename} saved_as={path} bytes={len(data)} md5={sha}")
+    pil_image = Image.open(io.BytesIO(data))
 
-    with open(path, "wb") as f:
-        f.write(data)
+    img_tensor = preprocess_image(pil_image)
 
-    try:
-        text = attentionhtr_predict_single(path)
-        return {"prediction": text}
-    except subprocess.CalledProcessError as e:
-        return JSONResponse({"error": f"AttentionHTR failed: {e}"}, status_code=500)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    with torch.no_grad():
+        dummy_text = torch.zeros((1, opt.batch_max_length), dtype=torch.long).to(device)
+        preds = model(img_tensor, dummy_text)
+        preds = preds.log_softmax(2)
+
+    preds_size = torch.IntTensor([preds.size(1)])
+    _, preds_index = preds.max(2)
+    preds_index = preds_index.transpose(1, 0)
+
+    raw_text = converter.decode(preds_index, preds_size)[0]
+    sentence = ctc_sentence_postprocess(raw_text)
+
+    return {
+        "raw": raw_text,
+        "sentence": sentence
+    }
