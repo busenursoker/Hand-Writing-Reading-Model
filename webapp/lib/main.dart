@@ -40,6 +40,7 @@ class _PredictWebScreenState extends State<PredictWebScreen> {
   String? _raw;                  // modelin ham çıktısı
   List<String> _alternatives = []; // alternatif adaylar
   bool _sentenceMode = false;     // false=Kelime, true=Cümle
+  bool _turkishLanguage = true;   // true=Türkçe, false=English
   List<String> _words = [];       // cümle modunda kelimeler
   String? _error;
   bool _loading = false;
@@ -113,6 +114,7 @@ class _PredictWebScreenState extends State<PredictWebScreen> {
       _raw = null;
       _alternatives = [];
       _words = [];
+      // Don't reset language when picking image
     });
 
     try {
@@ -140,9 +142,10 @@ class _PredictWebScreenState extends State<PredictWebScreen> {
     });
 
     try {
+      final language = _turkishLanguage ? "tr" : "en";
       final endpoint = _sentenceMode
-          ? "$baseUrl/predict-sentence"
-          : "$baseUrl/predict-word?infer_orientation=auto";
+          ? "$baseUrl/predict-sentence?language=$language&spell_correct_enabled=true"
+          : "$baseUrl/predict-word?infer_orientation=auto&language=$language&spell_correct_enabled=true";
 
       final uri = Uri.parse(endpoint);
 
@@ -429,6 +432,54 @@ class _PredictWebScreenState extends State<PredictWebScreen> {
                                     : (v) {
                                         setState(() {
                                           _sentenceMode = v;
+                                          _prediction = null;
+                                          _raw = null;
+                                          _alternatives = [];
+                                          _words = [];
+                                          _error = null;
+                                        });
+                                      },
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                          decoration: BoxDecoration(
+                            color: cs.surface,
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(color: cs.outlineVariant),
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(_turkishLanguage ? Icons.language : Icons.translate, color: cs.secondary),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      _turkishLanguage ? "Türkçe" : "English",
+                                      style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      _turkishLanguage
+                                          ? "Türkçe kelimeler için yazım düzeltmesi"
+                                          : "English spell correction enabled",
+                                      style: Theme.of(context).textTheme.bodySmall?.copyWith(color: cs.outline),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              Switch(
+                                value: _turkishLanguage,
+                                onChanged: _loading
+                                    ? null
+                                    : (v) {
+                                        setState(() {
+                                          _turkishLanguage = v;
                                           _prediction = null;
                                           _raw = null;
                                           _alternatives = [];

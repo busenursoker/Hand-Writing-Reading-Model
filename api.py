@@ -107,13 +107,17 @@ def candidates(word: str, WORDS: Counter) -> list:
     if known_words:
         return list(known_words)
     
-    known_edits1 = known(edits1(word_lower), WORDS)
-    if known_edits1:
-        return list(known_edits1)
+    # Only try edits1 if word is not too short (short words are often correct)
+    if len(word_lower) >= 3:
+        known_edits1 = known(edits1(word_lower), WORDS)
+        if known_edits1:
+            return list(known_edits1)
     
-    known_edits2 = known(edits2(word_lower), WORDS)
-    if known_edits2:
-        return list(known_edits2)
+    # Only try edits2 for longer words (4+ chars) to avoid over-correction
+    if len(word_lower) >= 4:
+        known_edits2 = known(edits2(word_lower), WORDS)
+        if known_edits2:
+            return list(known_edits2)
     
     return [word_lower]  # Return original if no corrections found
 
@@ -126,8 +130,18 @@ def spell_correct(word: str, language: str = "en") -> str:
     if not WORDS:
         return word  # No dictionary, return as-is
     
+    # Check if word is already in dictionary (exact match, case-insensitive)
+    word_lower = word.lower()
+    if word_lower in WORDS:
+        # Word is in dictionary, don't correct it
+        return word
+    
     cands = candidates(word, WORDS)
     if not cands:
+        return word
+    
+    # If the only candidate is the original word, return it
+    if len(cands) == 1 and cands[0] == word_lower:
         return word
     
     # Return the candidate with highest probability
@@ -138,8 +152,49 @@ def spell_correct(word: str, language: str = "en") -> str:
     original_prob = P(word.lower(), WORDS)
     best_prob = P(best, WORDS)
     
-    # If original is in dict and has reasonable probability, keep it
-    if original_prob > 0 and best_prob / original_prob < 10:
+    # If original is in dict, always keep it (don't correct)
+    if original_prob > 0:
+        return word
+    
+    # For words not in dictionary, be more conservative:
+    # Only correct if:
+    # 1. The correction has significant probability (not just a random match)
+    # 2. The word is long enough (short words like "dil" should be kept if close)
+    # 3. The edit distance is reasonable
+    
+    # Calculate edit distance between original and best candidate
+    def edit_distance(s1, s2):
+        if len(s1) < len(s2):
+            return edit_distance(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+        return previous_row[-1]
+    
+    distance = edit_distance(word.lower(), best)
+    word_len = len(word.lower())
+    
+    # Don't correct if:
+    # - Word is very short (2-3 chars) and distance > 1
+    # - Word is medium (4-5 chars) and distance > 2
+    # - Best candidate has very low probability (likely wrong match)
+    if word_len <= 3 and distance > 1:
+        return word  # Keep short words if edit distance is large
+    if word_len <= 5 and distance > 2:
+        return word  # Keep medium words if edit distance is too large
+    if best_prob < 1e-6:  # Very low probability, likely wrong
+        return word
+    
+    # Only correct if best has reasonable probability
+    if best_prob < 1e-5:
         return word
     
     # Preserve case
@@ -271,19 +326,26 @@ def segment_words_from_image(image_path: str, debug_out_path: str | None = None,
         except Exception as e:
             print(f"[SEGMENT] Conservative approach failed: {e}")
         
-        # Pick the best result: prefer more boxes (better segmentation) but not too many
+        # Pick the best result: prefer reasonable number of boxes (not too few, not too many)
         if results:
+            # Estimate expected number of words based on image width
+            # Rough estimate: average word width is about 5-10% of image width
+            estimated_words = max(2, min(15, w // 100))  # Reasonable range: 2-15 words
+            
             # Filter out results with too many boxes (likely over-segmentation)
-            filtered = [(b, name) for b, name in results if len(b) <= 20]
+            # Allow up to 3x estimated words to account for some over-segmentation
+            max_boxes = max(20, estimated_words * 3)
+            filtered = [(b, name) for b, name in results if len(b) <= max_boxes]
+            
             if filtered:
-                # Prefer results with more boxes (better word separation)
-                best_boxes, best_name = max(filtered, key=lambda x: len(x[0]))
-                print(f"[SEGMENT] Selected {best_name} approach with {len(best_boxes)} boxes")
+                # Prefer results closest to estimated word count
+                best_boxes, best_name = min(filtered, key=lambda x: abs(len(x[0]) - estimated_words))
+                print(f"[SEGMENT] Selected {best_name} approach with {len(best_boxes)} boxes (estimated: {estimated_words})")
                 boxes = best_boxes
             else:
-                # Fall back to any result
-                best_boxes, best_name = max(results, key=lambda x: len(x[0]))
-                print(f"[SEGMENT] Selected {best_name} approach with {len(best_boxes)} boxes (filtered)")
+                # Fall back to result with fewest boxes (less over-segmentation)
+                best_boxes, best_name = min(results, key=lambda x: len(x[0]))
+                print(f"[SEGMENT] Selected {best_name} approach with {len(best_boxes)} boxes (fallback - fewest)")
                 boxes = best_boxes
         else:
             # All approaches failed, use standard
@@ -324,10 +386,13 @@ def _segment_words_core(img, gray, w, h, kx_ratio=80, debug_out_path=None):
     )
     print(f"[SEGMENT] Adaptive threshold: block_size={block_size}, C={C}")
     
-    # Optional: Apply morphological opening to remove small noise
+    # Apply morphological operations to remove small noise
     # This helps clean up isolated pixels that might be detected as boxes
+    # Be more conservative to avoid removing actual text
     noise_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, noise_kernel, iterations=1)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, noise_kernel, iterations=1)  # Less aggressive
+    # Also apply closing to fill small gaps within letters
+    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, noise_kernel, iterations=1)
 
     # 3) Connect letters within a word (horizontal dilation)
     # Use kx_ratio parameter to control dilation aggressiveness
@@ -348,10 +413,10 @@ def _segment_words_core(img, gray, w, h, kx_ratio=80, debug_out_path=None):
         area = ww * hh
         img_area = w * h
         
-        # More lenient filtering
-        min_area = img_area * 0.0001  # reduced from 0.0003
-        min_height = max(5, h * 0.05)  # reduced from 0.08
-        min_width = max(3, w * 0.01)  # Minimum width to avoid single-letter artifacts
+        # Balanced filtering - not too strict, not too lenient
+        min_area = img_area * 0.0001  # Back to more lenient to catch valid words
+        min_height = max(5, h * 0.05)  # More lenient height threshold
+        min_width = max(3, w * 0.01)  # More lenient width threshold
         
         print(f"[CONTOUR {i}] x={x} y={y} w={ww} h={hh} area={area} min_area={min_area} min_height={min_height} min_width={min_width}")
         
@@ -388,10 +453,19 @@ def _segment_words_core(img, gray, w, h, kx_ratio=80, debug_out_path=None):
         # Real text should have a reasonable fill ratio (not too sparse)
         contour_area = cv2.contourArea(c)
         fill_ratio = contour_area / area if area > 0 else 0
-        min_fill_ratio = 0.15  # At least 15% of bounding box should be filled
+        min_fill_ratio = 0.15  # More lenient - 15% fill ratio
         
         if fill_ratio < min_fill_ratio:
             print(f"  -> REJECTED: fill ratio too low ({fill_ratio:.3f} < {min_fill_ratio}) - likely noise")
+            continue
+        
+        # Additional check: box aspect ratio - very narrow boxes are likely noise
+        aspect_ratio = ww / hh if hh > 0 else 0
+        if aspect_ratio > 10:  # Very wide and short = likely horizontal noise
+            print(f"  -> REJECTED: aspect ratio too high ({aspect_ratio:.2f}) - likely noise")
+            continue
+        if aspect_ratio < 0.1:  # Very tall and narrow = likely vertical noise
+            print(f"  -> REJECTED: aspect ratio too low ({aspect_ratio:.2f}) - likely noise")
             continue
         
         print(f"  -> ACCEPTED (density={density:.3f}, fill_ratio={fill_ratio:.3f})")
