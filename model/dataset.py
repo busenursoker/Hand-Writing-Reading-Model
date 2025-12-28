@@ -312,7 +312,7 @@ class AlignCollate(object):
         batch = filter(lambda x: x is not None, batch)
         images, labels = zip(*batch)
 
-        if self.keep_ratio_with_pad:  # same concept with 'Rosetta' paper
+        if self.keep_ratio_with_pad: 
             resized_max_w = self.imgW
             input_channel = 3 if images[0].mode == 'RGB' else 1
             transform = NormalizePAD((input_channel, self.imgH, resized_max_w))

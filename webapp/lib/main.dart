@@ -35,7 +35,12 @@ class PredictWebScreen extends StatefulWidget {
 
 class _PredictWebScreenState extends State<PredictWebScreen> {
   Uint8List? _imageBytes;
-  String? _prediction;
+
+  String? _prediction;           // post-processed (Türkçeleştirilmiş) sonuç
+  String? _raw;                  // modelin ham çıktısı
+  List<String> _alternatives = []; // alternatif adaylar
+  bool _sentenceMode = false;     // false=Kelime, true=Cümle
+  List<String> _words = [];       // cümle modunda kelimeler
   String? _error;
   bool _loading = false;
 
@@ -105,6 +110,9 @@ class _PredictWebScreenState extends State<PredictWebScreen> {
     setState(() {
       _error = null;
       _prediction = null;
+      _raw = null;
+      _alternatives = [];
+      _words = [];
     });
 
     try {
@@ -127,10 +135,17 @@ class _PredictWebScreenState extends State<PredictWebScreen> {
       _loading = true;
       _error = null;
       _prediction = null;
+      _raw = null;
+      _alternatives = [];
     });
 
     try {
-      final uri = Uri.parse("$baseUrl/predict-word?infer_orientation=auto");
+      final endpoint = _sentenceMode
+          ? "$baseUrl/predict-sentence"
+          : "$baseUrl/predict-word?infer_orientation=auto";
+
+      final uri = Uri.parse(endpoint);
+
       final req = http.MultipartRequest("POST", uri);
 
       req.files.add(
@@ -141,15 +156,38 @@ class _PredictWebScreenState extends State<PredictWebScreen> {
         ),
       );
 
-      final streamed = await req.send();
-      final resp = await http.Response.fromStream(streamed);
+      final streamed = await req.send().timeout(const Duration(seconds: 60));
+      final resp = await http.Response.fromStream(streamed).timeout(const Duration(seconds: 60));
 
       if (resp.statusCode != 200) {
         throw Exception("Server error: ${resp.statusCode}\n${resp.body}");
       }
 
       final data = jsonDecode(resp.body) as Map<String, dynamic>;
-      setState(() => _prediction = (data["prediction"] ?? "").toString());
+
+      setState(() {
+        _prediction = (data["prediction"] ?? "").toString();
+        _raw = (data["raw"] ?? "").toString();
+
+        // Kelime modunda alternatives var
+        final alt = data["alternatives"];
+        if (alt is List) {
+          _alternatives = alt.map((e) => e.toString()).toList();
+        } else {
+          _alternatives = [];
+        }
+
+        // Cümle modunda words listesi gelebilir
+        _words = [];
+        final words = data["words"];
+        if (words is List) {
+          // API words: [{best:..., raw:...}, ...] gibi
+          _words = words
+              .map((w) => (w is Map && w["best"] != null) ? w["best"].toString() : "")
+              .where((t) => t.trim().isNotEmpty)
+              .toList();
+        }
+      });
     } catch (e) {
       setState(() {
         _error =
@@ -232,26 +270,80 @@ class _PredictWebScreenState extends State<PredictWebScreen> {
       }
 
       if (_prediction != null) {
+        final rawText = (_raw ?? "").trim();
+
         return Card(
           margin: const EdgeInsets.only(top: 14),
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
           child: Padding(
             padding: const EdgeInsets.all(16),
-            child: Row(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                CircleAvatar(
-                  backgroundColor: cs.primaryContainer,
-                  child: Icon(Icons.text_fields, color: cs.onPrimaryContainer),
+                Row(
+                  children: [
+                    CircleAvatar(
+                      backgroundColor: cs.primaryContainer,
+                      child: Icon(Icons.text_fields, color: cs.onPrimaryContainer),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        _prediction!,
+                        style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                              fontWeight: FontWeight.w700,
+                            ),
+                      ),
+                    ),
+                  ],
                 ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    _prediction!,
-                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                          fontWeight: FontWeight.w700,
-                        ),
+                if (rawText.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  Text(
+                    "Ham çıktı: $rawText",
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(color: cs.outline),
                   ),
-                ),
+                ],
+                if (_alternatives.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  Text(
+                    "Alternatifler:",
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(color: cs.outline),
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: _alternatives.take(5).map((t) {
+                      final isSelected = t == _prediction;
+                      return ChoiceChip(
+                        label: Text(t),
+                        selected: isSelected,
+                        onSelected: (_) {
+                          setState(() => _prediction = t);
+                        },
+                      );
+                    }).toList(),
+                  ),
+                ],
+                if (_sentenceMode && _words.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    "Kelimeler:",
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(color: cs.outline),
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: _words.map((w) {
+                      return Chip(
+                        label: Text(w),
+                        backgroundColor: cs.secondaryContainer.withOpacity(0.5),
+                      );
+                    }).toList(),
+                  ),
+                ],
               ],
             ),
           ),
@@ -301,6 +393,54 @@ class _PredictWebScreenState extends State<PredictWebScreen> {
                         const SizedBox(height: 16),
                         if (_loading) const LinearProgressIndicator(),
                         if (_loading) const SizedBox(height: 12),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                          decoration: BoxDecoration(
+                            color: cs.surface,
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(color: cs.outlineVariant),
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(_sentenceMode ? Icons.notes : Icons.text_fields, color: cs.primary),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      _sentenceMode ? "Cümle Modu" : "Kelime Modu",
+                                      style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      _sentenceMode
+                                          ? "Boşluklara göre kelimelere ayırıp birleştirir"
+                                          : "Tek bir kelimeyi tahmin eder",
+                                      style: Theme.of(context).textTheme.bodySmall?.copyWith(color: cs.outline),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              Switch(
+                                value: _sentenceMode,
+                                onChanged: _loading
+                                    ? null
+                                    : (v) {
+                                        setState(() {
+                                          _sentenceMode = v;
+                                          _prediction = null;
+                                          _raw = null;
+                                          _alternatives = [];
+                                          _words = [];
+                                          _error = null;
+                                        });
+                                      },
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 14),
                         preview,
                         const SizedBox(height: 14),
                         Row(
@@ -317,7 +457,9 @@ class _PredictWebScreenState extends State<PredictWebScreen> {
                               child: FilledButton.tonalIcon(
                                 onPressed: canPredict ? predict : null,
                                 icon: Icon(_loading ? Icons.hourglass_top : Icons.play_arrow),
-                                label: Text(_loading ? "Tahmin ediliyor..." : "Tahmin Et"),
+                                label: Text(_loading
+                                    ? "Tahmin ediliyor..."
+                                    : (_sentenceMode ? "Cümleyi Oku" : "Kelimeyi Oku")),
                               ),
                             ),
                           ],
