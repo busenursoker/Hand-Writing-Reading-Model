@@ -180,22 +180,21 @@ def validation(model, criterion, evaluation_loader, converter, opt):
                 norm_ED += edit_distance(pred, gt) / len(gt)
             '''
 
-            # ICDAR2019 Normalized Edit Distance
+            
             if len(gt) == 0 or len(pred) == 0:
                 norm_ED += 0
             elif len(gt) > len(pred):
                 norm_ED += edit_distance(pred, gt) / len(gt)
             else:
-                norm_ED += edit_distance(pred, gt) / len(gt) # Changed to gt from pred.
+                norm_ED += edit_distance(pred, gt) / len(gt) 
 
-            # calculate confidence score (= multiply of pred_max_prob)
+            
             try:
                 confidence_score = pred_max_prob.cumprod(dim=0)[-1]
             except:
-                confidence_score = 0  # for empty pred case, when prune after "end of sentence" token ([s])
+                confidence_score = 0  
             confidence_score_list.append(confidence_score)
-            # print(pred, gt, pred==gt, confidence_score)
-
+            
     accuracy = n_correct / float(length_of_data) * 100
     norm_ED = norm_ED / float(length_of_data)  # ICDAR2019 Normalized Edit Distance https://arxiv.org/pdf/1909.07741.pdf
 

@@ -364,20 +364,17 @@ def segment_words_from_image(image_path: str, debug_out_path: str | None = None,
     return img, boxes
 
 def _segment_words_core(img, gray, w, h, kx_ratio=80, debug_out_path=None):
-    """Core segmentation logic with configurable dilation."""
+    """Core segmentation logic with configurable dilation and improved handling of tall letters."""
 
     # 1) Normalize lighting a bit (safe for handwriting)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     g = clahe.apply(gray)
 
     # 2) Binary (ink=white) for contour detection ONLY
-    # Use larger block size and higher C value to reduce noise
-    # This helps avoid detecting empty spaces and background artifacts
-    # blockSize must be odd and > 1
     block_size = max(31, w // 20)
     if block_size % 2 == 0:
         block_size += 1  # Make it odd
-    C = 12  # Slightly higher to reduce false positives
+    C = 12
     bw = cv2.adaptiveThreshold(
         g, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -387,20 +384,24 @@ def _segment_words_core(img, gray, w, h, kx_ratio=80, debug_out_path=None):
     print(f"[SEGMENT] Adaptive threshold: block_size={block_size}, C={C}")
     
     # Apply morphological operations to remove small noise
-    # This helps clean up isolated pixels that might be detected as boxes
-    # Be more conservative to avoid removing actual text
     noise_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, noise_kernel, iterations=1)  # Less aggressive
-    # Also apply closing to fill small gaps within letters
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, noise_kernel, iterations=1)
     bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, noise_kernel, iterations=1)
 
     # 3) Connect letters within a word (horizontal dilation)
-    # Use kx_ratio parameter to control dilation aggressiveness
-    kx = max(6, w // kx_ratio)   # Dilation based on ratio (lower ratio = more aggressive)
-    ky = max(2, h // 200)  # Small vertical dilation
+    # INCREASED vertical dilation to better connect tall letters like T, I to baseline
+    # AND to connect diacritics (dots, accents) with their base letters
+    kx = max(6, w // kx_ratio)
+    ky = max(5, h // 80)  # FURTHER INCREASED for better vertical connectivity (especially for Turkish diacritics)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kx, ky))
     merged = cv2.dilate(bw, kernel, iterations=1)
     print(f"[SEGMENT] Dilation kernel: {kx}x{ky} (ratio={kx_ratio}, image size: {w}x{h})")
+    
+    # Additional targeted dilation to connect vertically close components (like diacritics)
+    # This helps connect dots on ü, ö, ı with their base letters
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, h // 50)))
+    merged = cv2.dilate(merged, vertical_kernel, iterations=1)
+    print(f"[SEGMENT] Additional vertical dilation: 1x{max(3, h // 50)}")
 
     # 4) Find connected components => word blobs
     cnts, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -413,14 +414,14 @@ def _segment_words_core(img, gray, w, h, kx_ratio=80, debug_out_path=None):
         area = ww * hh
         img_area = w * h
         
-        # Balanced filtering - not too strict, not too lenient
-        min_area = img_area * 0.0001  # Back to more lenient to catch valid words
-        min_height = max(5, h * 0.05)  # More lenient height threshold
-        min_width = max(3, w * 0.01)  # More lenient width threshold
+        # Balanced filtering
+        min_area = img_area * 0.00005  # REDUCED from 0.0001 to catch smaller components (diacritics)
+        min_height = max(3, h * 0.03)  # REDUCED from 0.05 to catch diacritics
+        min_width = max(2, w * 0.005)  # REDUCED from 0.01 to catch diacritics
         
-        print(f"[CONTOUR {i}] x={x} y={y} w={ww} h={hh} area={area} min_area={min_area} min_height={min_height} min_width={min_width}")
+        print(f"[CONTOUR {i}] x={x} y={y} w={ww} h={hh} area={area}")
         
-        # filter tiny noise
+        # filter only extremely tiny noise (but keep diacritics)
         if area < min_area:
             print(f"  -> REJECTED: area too small ({area} < {min_area})")
             continue
@@ -428,44 +429,41 @@ def _segment_words_core(img, gray, w, h, kx_ratio=80, debug_out_path=None):
             print(f"  -> REJECTED: height too small ({hh} < {min_height})")
             continue
         if ww < min_width:
-            print(f"  -> REJECTED: width too small ({ww} < {min_width}) - likely artifact")
+            print(f"  -> REJECTED: width too small ({ww} < {min_width})")
             continue
         
-        # Check pixel density: ensure the bounding box actually contains foreground pixels
-        # Extract the region from the binary image
+        # Check pixel density
         box_region = merged[y:y+hh, x:x+ww]
         if box_region.size == 0:
             print(f"  -> REJECTED: empty region")
             continue
         
-        # Count foreground pixels (white in our inverted binary image)
         foreground_pixels = np.sum(box_region == 255)
         total_pixels = box_region.size
         density = foreground_pixels / total_pixels if total_pixels > 0 else 0
         
-        # Require at least 5% foreground density to avoid empty boxes
-        min_density = 0.05
+        # RELAXED density requirement to allow diacritics (which are often sparse)
+        min_density = 0.03  # REDUCED from 0.05
         if density < min_density:
-            print(f"  -> REJECTED: density too low ({density:.3f} < {min_density}) - likely empty space")
+            print(f"  -> REJECTED: density too low ({density:.3f} < {min_density})")
             continue
         
-        # Also check contour area vs bounding box area ratio
-        # Real text should have a reasonable fill ratio (not too sparse)
+        # Contour fill ratio
         contour_area = cv2.contourArea(c)
         fill_ratio = contour_area / area if area > 0 else 0
-        min_fill_ratio = 0.15  # More lenient - 15% fill ratio
+        min_fill_ratio = 0.08  # REDUCED from 0.15 to allow diacritics
         
         if fill_ratio < min_fill_ratio:
-            print(f"  -> REJECTED: fill ratio too low ({fill_ratio:.3f} < {min_fill_ratio}) - likely noise")
+            print(f"  -> REJECTED: fill ratio too low ({fill_ratio:.3f} < {min_fill_ratio})")
             continue
         
-        # Additional check: box aspect ratio - very narrow boxes are likely noise
+        # Aspect ratio check
         aspect_ratio = ww / hh if hh > 0 else 0
-        if aspect_ratio > 10:  # Very wide and short = likely horizontal noise
-            print(f"  -> REJECTED: aspect ratio too high ({aspect_ratio:.2f}) - likely noise")
+        if aspect_ratio > 10:
+            print(f"  -> REJECTED: aspect ratio too high ({aspect_ratio:.2f})")
             continue
-        if aspect_ratio < 0.1:  # Very tall and narrow = likely vertical noise
-            print(f"  -> REJECTED: aspect ratio too low ({aspect_ratio:.2f}) - likely noise")
+        if aspect_ratio < 0.1:
+            print(f"  -> REJECTED: aspect ratio too low ({aspect_ratio:.2f})")
             continue
         
         print(f"  -> ACCEPTED (density={density:.3f}, fill_ratio={fill_ratio:.3f})")
@@ -474,34 +472,77 @@ def _segment_words_core(img, gray, w, h, kx_ratio=80, debug_out_path=None):
     # Sort left-to-right
     boxes.sort(key=lambda b: b[0])
     
-    # Filter out boxes that are likely noise (too far from main text line)
+    # STAGE 1: Remove obviously tiny noise (dots, small artifacts)
+    # These are typically much smaller than actual text - do this FIRST
     if len(boxes) > 1:
-        # Find the median y-coordinate (main text line)
-        y_coords = [b[1] for b in boxes]
-        median_y = np.median(y_coords)
+        widths = [b[2] for b in boxes]
+        heights = [b[3] for b in boxes]
+        areas = [b[2] * b[3] for b in boxes]
         
-        # Find the median height
+        median_width = np.median(widths)
+        median_height = np.median(heights)
+        median_area = np.median(areas)
+        
+        print(f"[SEGMENT] Size stats: median_width={median_width:.1f}px, median_height={median_height:.1f}px, median_area={median_area:.1f}px²")
+        
+        # Remove boxes that are extremely small compared to median
+        # These are likely dots, small artifacts, not actual words
+        min_relative_width = median_width * 0.15  # At least 15% of median width
+        min_relative_height = median_height * 0.20  # At least 20% of median height
+        min_relative_area = median_area * 0.05  # At least 5% of median area
+        
+        filtered_boxes = []
+        for b in boxes:
+            x, y, w, h = b
+            area = w * h
+            
+            # Keep box if it meets size requirements
+            if w >= min_relative_width and h >= min_relative_height and area >= min_relative_area:
+                filtered_boxes.append(b)
+            else:
+                print(f"[SEGMENT] Filtered tiny artifact at x={x}, y={y}, w={w}, h={h} (thresholds: w>={min_relative_width:.1f}, h>={min_relative_height:.1f}, area>={min_relative_area:.1f})")
+        
+        if len(filtered_boxes) < len(boxes):
+            print(f"[SEGMENT] Removed {len(boxes) - len(filtered_boxes)} tiny artifacts in Stage 1")
+            boxes = filtered_boxes
+        else:
+            print(f"[SEGMENT] Stage 1: No tiny artifacts to remove")
+    
+    # STAGE 2: Filter out boxes that are too far from main text line
+    # This is meant to remove stray marks/noise, not actual text
+    if len(boxes) > 2:  # Only filter if we have more than 2 boxes
+        y_coords = [b[1] for b in boxes]
+        y_centers = [b[1] + b[3] / 2 for b in boxes]
+        median_y_center = np.median(y_centers)
+        
         heights = [b[3] for b in boxes]
         median_h = np.median(heights)
         
-        # Allow boxes within 2x median height from the median line
-        max_y_deviation = median_h * 2.0
+        # Be more lenient - allow up to 3x median height deviation
+        # Handwriting naturally has baseline variation
+        max_y_deviation = median_h * 3.0
         
         filtered_boxes = []
         for b in boxes:
             y_center = b[1] + b[3] / 2
-            deviation = abs(y_center - median_y)
+            deviation = abs(y_center - median_y_center)
             if deviation <= max_y_deviation:
                 filtered_boxes.append(b)
             else:
-                print(f"[SEGMENT] Filtered out box at y={b[1]} (deviation={deviation:.1f} > {max_y_deviation:.1f})")
+                print(f"[SEGMENT] Stage 2: Filtered out box at y={b[1]} (deviation={deviation:.1f} > {max_y_deviation:.1f})")
         
-        if len(filtered_boxes) < len(boxes):
-            print(f"[SEGMENT] Filtered {len(boxes) - len(filtered_boxes)} boxes that were too far from main text line")
-            boxes = filtered_boxes
+        # Only apply filter if we're removing less than 30% of boxes
+        # (if we're removing more, the filter is probably too aggressive)
+        if len(filtered_boxes) >= len(boxes) * 0.7:
+            if len(filtered_boxes) < len(boxes):
+                print(f"[SEGMENT] Stage 2: Filtered {len(boxes) - len(filtered_boxes)} boxes that were too far from main text line")
+                boxes = filtered_boxes
+            else:
+                print(f"[SEGMENT] Stage 2: All boxes are on the main text line")
+        else:
+            print(f"[SEGMENT] Stage 2 filter too aggressive ({len(filtered_boxes)}/{len(boxes)} kept), keeping all boxes")
     
-    # Smart merging: analyze gaps to distinguish letter gaps (within words) from word gaps (between words)
-    # Be VERY conservative - only merge when clearly part of same word
+    # IMPROVED MERGING: Special handling for narrow boxes and diacritics
     if len(boxes) > 1:
         gaps = []
         for i in range(len(boxes) - 1):
@@ -511,25 +552,21 @@ def _segment_words_core(img, gray, w, h, kx_ratio=80, debug_out_path=None):
             gaps.append(gap)
         
         if gaps:
-            # Use percentiles to better understand gap distribution
             gaps_array = np.array(gaps)
-            p25 = np.percentile(gaps_array, 25)  # 25th percentile (small gaps - likely letters)
-            p75 = np.percentile(gaps_array, 75)  # 75th percentile (larger gaps - likely words)
             median_gap = np.median(gaps_array)
             
-            # Letter gaps are typically in the lower percentiles
-            # Word gaps are typically much larger
-            # Use a conservative threshold: only merge very small gaps
-            max_letter_gap_absolute = min(p25 * 2.0, w * 0.015)  # Very conservative: 1.5% of width max
-            max_letter_gap_relative = np.mean([b[2] for b in boxes]) * 0.2  # 20% of average box width
+            # Calculate average width and height to identify narrow/small boxes
+            widths = [b[2] for b in boxes]
+            heights = [b[3] for b in boxes]
+            avg_width = np.mean(widths)
+            median_width = np.median(widths)
+            avg_height = np.mean(heights)
+            median_height = np.median(heights)
             
-            # Use the smaller of the two to be very conservative
-            max_letter_gap = min(max_letter_gap_absolute, max_letter_gap_relative)
+            print(f"[SEGMENT] Width analysis: avg={avg_width:.1f}px, median={median_width:.1f}px")
+            print(f"[SEGMENT] Height analysis: avg={avg_height:.1f}px, median={median_height:.1f}px")
+            print(f"[SEGMENT] Gap analysis: median={median_gap:.1f}px")
             
-            print(f"[SEGMENT] Gap analysis: p25={p25:.1f}px, median={median_gap:.1f}px, p75={p75:.1f}px")
-            print(f"[SEGMENT] Max letter gap threshold: {max_letter_gap:.1f}px")
-            
-            # Now merge boxes that are clearly part of the same word
             merged_boxes = []
             merged_boxes.append(list(boxes[0]))
             
@@ -537,7 +574,6 @@ def _segment_words_core(img, gray, w, h, kx_ratio=80, debug_out_path=None):
                 prev_x, prev_y, prev_w, prev_h = merged_boxes[-1]
                 curr_x, curr_y, curr_w, curr_h = boxes[i]
                 
-                # Calculate gap between boxes
                 gap = curr_x - (prev_x + prev_w)
                 
                 # Calculate vertical overlap
@@ -546,48 +582,132 @@ def _segment_words_core(img, gray, w, h, kx_ratio=80, debug_out_path=None):
                 vertical_overlap = max(0, min(prev_bottom, curr_bottom) - max(prev_y, curr_y))
                 overlap_ratio = vertical_overlap / min(prev_h, curr_h) if min(prev_h, curr_h) > 0 else 0
                 
-                # Calculate what the merged box would look like
+                # Check if boxes are very small (likely diacritics like dots on ü, ö, ı, ş)
+                # Diacritics are typically:
+                # - Very small in both width and height (< 20% of median)
+                # - Above or slightly overlapping with the main letter
+                prev_is_tiny = (prev_w < median_width * 0.2 and prev_h < median_height * 0.3)
+                curr_is_tiny = (curr_w < median_width * 0.2 and curr_h < median_height * 0.3)
+                
+                # Check if current box is above previous (diacritic case)
+                curr_is_above = curr_y < prev_y
+                prev_is_above = prev_y < curr_y
+                
+                # Check if previous or current box is narrow (likely part of a letter like T, I, l)
+                # A box is "narrow" if it's less than 35% of the median width
+                prev_is_narrow = prev_w < (median_width * 0.35)
+                curr_is_narrow = curr_w < (median_width * 0.35)
+                
+                # Calculate merged dimensions
                 would_be_width = (curr_x + curr_w) - prev_x
                 would_be_height = max(prev_bottom, curr_bottom) - min(prev_y, curr_y)
                 avg_height = (prev_h + curr_h) / 2
                 
-                # Very strict merging criteria:
-                # 1. Gap must be VERY small (definitely a letter gap, not word gap)
-                # 2. High vertical overlap (same baseline - at least 70%)
-                # 3. Merged box shouldn't be too wide (max 4x height for a word)
-                # 4. Gap should be less than average box height (letters are close)
-                max_reasonable_width_ratio = 4.0  # Words shouldn't be more than 4x height
-                gap_vs_height = gap / avg_height if avg_height > 0 else float('inf')
+                # HIGHEST PRIORITY: Merge diacritics (dots, accents) with their base letters
+                # This handles Turkish characters like ü, ö, ı, ş, ğ, ç
+                if (prev_is_tiny and curr_is_above) or (curr_is_tiny and prev_is_above):
+                    # One box is tiny and positioned above/below the other = diacritic
+                    # Be very aggressive with merging - allow large gaps
+                    max_diacritic_gap = avg_height * 2.0
+                    
+                    # Also check horizontal alignment - diacritic should be roughly above the letter
+                    horizontal_overlap_start = max(prev_x, curr_x)
+                    horizontal_overlap_end = min(prev_x + prev_w, curr_x + curr_w)
+                    horizontal_overlap = max(0, horizontal_overlap_end - horizontal_overlap_start)
+                    
+                    # Allow merging even with negative gaps (overlapping) for diacritics
+                    should_merge = (
+                        gap < max_diacritic_gap and
+                        (horizontal_overlap > 0 or gap < median_width * 0.5)  # Either overlapping or close
+                    )
+                    
+                    if should_merge:
+                        new_x = min(prev_x, curr_x)
+                        new_y = min(prev_y, curr_y)
+                        new_w = max(prev_x + prev_w, curr_x + curr_w) - new_x
+                        new_h = max(prev_bottom, curr_bottom) - new_y
+                        merged_boxes[-1] = [new_x, new_y, new_w, new_h]
+                        print(f"[SEGMENT] Merged DIACRITIC {i-1} and {i}: gap={gap:.1f}px, prev_tiny={prev_is_tiny}, curr_tiny={curr_is_tiny}")
+                    else:
+                        merged_boxes.append(list(boxes[i]))
+                        print(f"[SEGMENT] Kept separate (diacritic check failed): gap={gap:.1f}px")
                 
-                should_merge = (
-                    gap < max_letter_gap and  # Gap is very small
-                    gap < avg_height * 0.8 and  # Gap is less than 80% of average height
-                    overlap_ratio >= 0.7 and  # High vertical alignment (70%+)
-                    (would_be_height == 0 or would_be_width / would_be_height < max_reasonable_width_ratio) and
-                    gap_vs_height < 1.0  # Gap is smaller than box height
-                )
+                # SECOND PRIORITY: Merge narrow boxes (tall letters like T, I, l)
+                elif prev_is_narrow or curr_is_narrow:
+                    # For narrow boxes, be more aggressive with merging
+                    max_merge_gap = avg_height * 1.5  # Allow larger gaps for narrow boxes
+                    min_overlap = 0.4  # Require less vertical overlap
+                    
+                    should_merge = (
+                        gap < max_merge_gap and
+                        gap >= 0 and  # Don't merge if overlapping (handled by diacritic case)
+                        overlap_ratio >= min_overlap and
+                        (would_be_height == 0 or would_be_width / would_be_height < 6.0)
+                    )
+                    
+                    if should_merge:
+                        new_x = prev_x
+                        new_y = min(prev_y, curr_y)
+                        new_w = (curr_x + curr_w) - prev_x
+                        new_h = max(prev_bottom, curr_bottom) - new_y
+                        merged_boxes[-1] = [new_x, new_y, new_w, new_h]
+                        print(f"[SEGMENT] Merged NARROW box {i-1} and {i}: gap={gap:.1f}px, prev_narrow={prev_is_narrow}, curr_narrow={curr_is_narrow}")
+                    else:
+                        merged_boxes.append(list(boxes[i]))
+                        print(f"[SEGMENT] Kept separate (narrow): gap={gap:.1f}px (>{max_merge_gap:.1f}px) or overlap={overlap_ratio:.2f}<{min_overlap}")
                 
-                if should_merge:
-                    # Merge boxes
-                    new_x = prev_x
-                    new_y = min(prev_y, curr_y)
-                    new_w = (curr_x + curr_w) - prev_x
-                    new_h = max(prev_bottom, curr_bottom) - new_y
-                    merged_boxes[-1] = [new_x, new_y, new_w, new_h]
-                    print(f"[SEGMENT] Merged box {i-1} and {i}: gap={gap:.1f}px ({gap/avg_height*100:.1f}% of height), overlap={overlap_ratio:.2f}, size={new_w}x{new_h}")
+                # STANDARD: Regular merging for normal-width boxes
                 else:
-                    merged_boxes.append(list(boxes[i]))
-                    print(f"[SEGMENT] Kept separate: gap={gap:.1f}px (>{max_letter_gap:.1f}px or overlap={overlap_ratio:.2f}<0.7)")
+                    # Standard merging for regular-width boxes
+                    max_letter_gap = min(median_gap * 0.5, avg_height * 0.8, w * 0.015)
+                    
+                    should_merge = (
+                        gap < max_letter_gap and
+                        gap < avg_height * 0.8 and
+                        overlap_ratio >= 0.7 and
+                        (would_be_height == 0 or would_be_width / would_be_height < 4.0)
+                    )
+                    
+                    if should_merge:
+                        new_x = prev_x
+                        new_y = min(prev_y, curr_y)
+                        new_w = (curr_x + curr_w) - prev_x
+                        new_h = max(prev_bottom, curr_bottom) - new_y
+                        merged_boxes[-1] = [new_x, new_y, new_w, new_h]
+                        print(f"[SEGMENT] Merged REGULAR box {i-1} and {i}: gap={gap:.1f}px, overlap={overlap_ratio:.2f}")
+                    else:
+                        merged_boxes.append(list(boxes[i]))
+                        print(f"[SEGMENT] Kept separate (regular): gap={gap:.1f}px or overlap={overlap_ratio:.2f}")
             
             boxes = [tuple(b) for b in merged_boxes]
-        else:
-            boxes = boxes  # No gaps to analyze, keep as is
-    else:
-        boxes = boxes  # Only one box, nothing to merge
     
     print(f"[SEGMENT] Kept {len(boxes)} word boxes after filtering and merging")
     
     return boxes
+
+def is_valid_word_token(token: str) -> bool:
+    if not token:
+        return False
+
+    token = token.strip()
+
+    # Too short to be a real word
+    if len(token) < 2:
+        return False
+
+    # Must contain at least one letter (not only digits)
+    if not re.search(r"[a-zA-ZçğıöşüÇĞİÖŞÜ]", token):
+        return False
+
+    # Reject pure numbers or letter-number garbage
+    if re.fullmatch(r"[0-9]+", token):
+        return False
+
+    # Reject single-letter noise (I, l, o, etc.)
+    if len(token) == 1:
+        return False
+
+    return True
 
 
 def crop_words_to_tempdir(img_bgr, boxes, out_dir: Path):
@@ -1065,7 +1185,10 @@ async def predict_sentence_api(
                     if corrected != best_word:
                         print(f"[SPELL] Word {i}: '{best_word}' -> '{corrected}'")
                         best_word = corrected
-                
+                # HARD REJECTION of garbage tokens
+                if not is_valid_word_token(best_word):
+                    print(f"[SENTENCE] Dropping invalid token: '{best_word}'")
+                    best_word = ""
                 words.append({
                     "raw": pp["raw"],
                     "best": best_word,
